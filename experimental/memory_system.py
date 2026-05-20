@@ -1,7 +1,8 @@
-﻿import sqlite3
+import sqlite3
 import json
 import os
 import logging
+import threading
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -17,11 +18,12 @@ class MemorySystem:
         self._embedder = None
         self._tfidf_vocab = {}
         self._tfidf_docs = []
+        self._db_lock = threading.Lock()
         self._init_db()
         self._init_vectordb()
 
     def _init_db(self):
-        self.conn = sqlite3.connect(self.db_path)
+        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         for table in ["episodic", "semantic", "procedural", "reflective"]:
             self.conn.execute(f"""
@@ -113,11 +115,12 @@ class MemorySystem:
             except Exception as e:
                 logger.warning(f"ChromaDB insert failed: {e}")
         self._update_tfidf(content)
-        self.conn.execute(
-            f"INSERT INTO {table} (id, content, metadata, embedding_id, importance, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
-            (mem_id, content, meta_json, embedding_id, importance, ts),
-        )
-        self.conn.commit()
+        with self._db_lock:
+            self.conn.execute(
+                f"INSERT INTO {table} (id, content, metadata, embedding_id, importance, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
+                (mem_id, content, meta_json, embedding_id, importance, ts),
+            )
+            self.conn.commit()
         return mem_id
 
     def store_episodic(self, content: str, metadata: dict = None,
@@ -143,29 +146,31 @@ class MemorySystem:
         return self._retrieve_sql("semantic", query, k)
 
     def _retrieve_sql(self, table: str, query: str, k: int = 10) -> list:
-        cursor = self.conn.execute(
-            f"SELECT * FROM {table} WHERE content LIKE ? ORDER BY timestamp DESC LIMIT ?",
-            (f"%{query}%", k),
-        )
-        results = []
-        for row in cursor:
-            self.conn.execute(
-                f"UPDATE {table} SET access_count = access_count + 1 WHERE id = ?",
-                (row["id"],),
+        with self._db_lock:
+            cursor = self.conn.execute(
+                f"SELECT * FROM {table} WHERE content LIKE ? ORDER BY timestamp DESC LIMIT ?",
+                (f"%{query}%", k),
             )
-            results.append(dict(row))
-        self.conn.commit()
+            results = []
+            for row in cursor:
+                self.conn.execute(
+                    f"UPDATE {table} SET access_count = access_count + 1 WHERE id = ?",
+                    (row["id"],),
+                )
+                results.append(dict(row))
+            self.conn.commit()
         return results
 
     def retrieve_all_recent(self, k: int = 10) -> list:
         tables = ["episodic", "semantic", "procedural", "reflective"]
         results = []
-        for table in tables:
-            cursor = self.conn.execute(
-                f"SELECT *, '{table}' as memory_type FROM {table} ORDER BY timestamp DESC LIMIT ?",
-                (k // len(tables) + 1,),
-            )
-            results.extend(dict(row) for row in cursor)
+        with self._db_lock:
+            for table in tables:
+                cursor = self.conn.execute(
+                    f"SELECT *, '{table}' as memory_type FROM {table} ORDER BY timestamp DESC LIMIT ?",
+                    (k // len(tables) + 1,),
+                )
+                results.extend(dict(row) for row in cursor)
         results.sort(key=lambda x: x.get("timestamp", ""), reverse=True)
         return results[:k]
 

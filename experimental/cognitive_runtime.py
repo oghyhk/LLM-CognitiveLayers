@@ -18,7 +18,9 @@ OUTPUT_SCHEMA = {
     "sentiment": 0.0,
 }
 
-REASONING_SYSTEM_PROMPT = """You are Basti, a cognitive AI built on the DaoTi framework (base LLM: deepseek-v4-flash). You have persistent memory, identity, and self-reflection.
+COMPACT_SCHEMA_DESC = '{"intent":"string","state_update":{},"memory_write":"string or null","reasoning":"string","response":"string","uncertainty":0.5,"follow_up_questions":["string"],"user_facts":["string"],"self_reflection":"string or null","sentiment":0.0}'
+
+REASONING_SYSTEM_PROMPT = """You are Basti, a cognitive AI built on the DaoTi framework (base LLM: deepseek-v4-flash).
 
 {identity_context}
 
@@ -35,19 +37,18 @@ REASONING_SYSTEM_PROMPT = """You are Basti, a cognitive AI built on the DaoTi fr
 {memory_summary}
 
 ## Output Format
+Output ONLY valid JSON matching this schema:
 {output_schema}
 
 ## Instructions
-1. Analyze the user's intent carefully
-2. Set "user_facts" to any new facts you learn about the user (e.g. their job, interests, preferences, location)
-3. Set "self_reflection" to a brief insight about yourself from this interaction (optional)
-4. Set "sentiment" to user's emotional tone: -1.0 (negative) to 1.0 (positive)
-5. Reason step by step before responding
+1. Analyze the user's intent
+2. Set "user_facts" to any new facts about the user
+3. Optional "self_reflection" insight about yourself
+4. "sentiment": -1.0 (negative) to 1.0 (positive)
+5. "uncertainty": 0.0 (certain) to 1.0 (unsure)
 6. Be honest about what you know and don't know
-7. Set uncertainty level: 0.0 (certain) to 1.0 (completely unsure)
-8. Output structured JSON as specified
 
-Output ONLY valid JSON. No other text."""
+No other text."""
 
 
 class CognitiveRuntime:
@@ -66,6 +67,9 @@ class CognitiveRuntime:
         self.conversation_history = []
         self.current_step = "idle"
         self.last_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        self._cached_identity = None
+        self._cached_identity_version = 0
+        self._cached_user_ctx = None
 
     def process(self, user_input: str) -> str:
         self.current_step = "parsing input"
@@ -96,44 +100,42 @@ class CognitiveRuntime:
         self.current_step = "checking capabilities"
         can_handle, confidence = self.self_model.can_handle(user_input)
 
-        state_summary = json.dumps({
-            "goals": [g.get("description", "") for g in self.state.active_goals],
-            "emotions": self.state.emotional_weights,
-            "uncertainties": self.state.uncertainty_map,
-            "focus": self.state.attention_focus,
-            "confidence": confidence,
-        }, indent=2)
+        goals = [g.get("description", "") for g in self.state.active_goals]
+        emotions = self.state.emotional_weights
+        state_summary = (
+            f"goals={goals}, emotions={emotions}, confidence={confidence:.2f}"
+            if goals or emotions
+            else f"confidence={confidence:.2f}"
+        )
 
         self.current_step = "building identity context"
-        identity_context = self.self_model.get_identity_prompt()
+        if self._cached_identity is None or self.self_model.identity_version != self._cached_identity_version:
+            self._cached_identity = self.self_model.get_identity_prompt()
+            self._cached_identity_version = self.self_model.identity_version
+        identity_context = self._cached_identity
 
         self.current_step = "loading user profile"
         user_context = "No user profile yet."
         if self.user_model:
             user_context = self.user_model.get_user_context()
 
-        schema_str = json.dumps(OUTPUT_SCHEMA, indent=2)
-        reflection_instruction = self.self_model.identity_reflection_prompt()
-
         system_prompt = REASONING_SYSTEM_PROMPT.format(
             identity_context=identity_context,
             user_context=user_context,
             state_summary=state_summary,
             active_concepts=", ".join(active_names) if active_names else "none",
-            memory_summary=memory_context,
-            output_schema=schema_str,
+            memory_summary=memory_context[:500] if memory_context else "none",
+            output_schema=COMPACT_SCHEMA_DESC,
         )
-        system_prompt += "\n" + reflection_instruction
 
         if plan_result.get("response_mode") == "direct":
-            system_prompt += "\nThis is a simple query. Answer directly without extensive planning."
+            system_prompt += "\nDirect mode: answer concisely."
 
         if can_handle:
-            system_prompt += f"\nYou can handle this task with confidence {confidence:.2f}."
+            system_prompt += f"\nConfidence: {confidence:.2f}."
         else:
             system_prompt += (
-                f"\nYou have low confidence ({confidence:.2f}) in this domain. "
-                "Acknowledge this and ask clarifying questions if needed."
+                f"\nLow confidence ({confidence:.2f}). Ask clarifying questions."
             )
 
         messages = [{"role": "user", "content": user_input}]

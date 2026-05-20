@@ -2,7 +2,7 @@ import json
 import os
 import sys
 import logging
-from http.server import HTTPServer, SimpleHTTPRequestHandler
+from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
 from dotenv import load_dotenv
@@ -194,7 +194,7 @@ def main():
 
     host = config["host"]
     port = config["port"]
-    server = HTTPServer((host, port), APIHandler)
+    server = ThreadingHTTPServer((host, port), APIHandler)
     print(f"\n  Basti Web UI running at:  http://{host}:{port}")
     print(f"  Press Ctrl+C to stop\n")
 
