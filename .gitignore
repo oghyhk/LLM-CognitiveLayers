@@ -8,6 +8,7 @@ __pycache__/
 
 # Runtime data (regenerated on first run)
 data/
+local_data/
 
 # IDE
 .vscode/

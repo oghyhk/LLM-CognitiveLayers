@@ -15,7 +15,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger("daoti.web")
 
-runtime = None
+api_runtime = None
+local_runtime = None
+current_mode = "api"
 
 
 def get_config():
@@ -33,10 +35,12 @@ def get_config():
         "memory_retrieval_count": int(os.getenv("MEMORY_RETRIEVAL_COUNT", "10")),
         "host": os.getenv("HOST", "127.0.0.1"),
         "port": int(os.getenv("PORT", "8080")),
+        "local_model": os.getenv("LOCAL_MODEL", "gemma:2b"),
+        "local_base_url": os.getenv("LOCAL_BASE_URL", "http://localhost:11434/v1"),
     }
 
 
-def build_runtime(config):
+def build_api_runtime(config):
     from api_client import APIClient
     from cognitive_state import CognitiveState
     from concept_graph import ConceptGraph
@@ -61,7 +65,7 @@ def build_runtime(config):
         cognitive_state=CognitiveState(),
         concept_graph=ConceptGraph(),
         attention_engine=AttentionEngine(decay_factor=config["attention_decay"]),
-        memory_system=MemorySystem(),
+        memory_system=MemorySystem(db_path="data/api_memory.db", vector_path="data/api_vectors"),
         planning_engine=PlanningEngine(
             max_branches=config["planning_branches"],
             max_depth=config["planning_depth"],
@@ -71,33 +75,79 @@ def build_runtime(config):
         user_model=UserModel(),
     )
     if not os.path.exists(os.path.join("data", "user_model.json")):
-        from datetime import datetime, timezone
-        now = datetime.now(timezone.utc).isoformat()
-        rt.user_model.name = "Oscar"
-        rt.user_model.expertise_levels = {
-            "programming": 0.4, "ai_ml": 0.35, "general_tech": 0.5,
-            "math": 0.45, "design": 0.3, "writing": 0.4, "science": 0.4,
-        }
-        rt.user_model.personal_facts = [
-            {"fact": "18 years old", "timestamp": now},
-            {"fact": "HKUST student in Hong Kong", "timestamp": now},
-            {"fact": "Interested in AI and technology", "timestamp": now},
-        ]
-        rt.user_model.topics_of_interest = {
-            "python": 2, "ai": 3, "machine learning": 2,
-            "programming": 1, "science": 1,
-        }
-        rt.user_model.communication_style = "curious"
-        logger.info("Seeded initial user data for Oscar")
-        try:
-            rt.save_state("data")
-        except Exception as e:
-            logger.warning(f"Failed to save seed data: {e}")
+        _seed_api_user(rt)
     if os.path.exists("data"):
         try:
             rt.load_state("data")
         except Exception as e:
-            logger.warning(f"Could not load saved state: {e}")
+            logger.warning(f"Could not load API state: {e}")
+    return rt
+
+
+def _seed_api_user(rt):
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).isoformat()
+    rt.user_model.name = "Oscar"
+    rt.user_model.expertise_levels = {
+        "programming": 0.4, "ai_ml": 0.35, "general_tech": 0.5,
+        "math": 0.45, "design": 0.3, "writing": 0.4, "science": 0.4,
+    }
+    rt.user_model.personal_facts = [
+        {"fact": "18 years old", "timestamp": now},
+        {"fact": "HKUST student in Hong Kong", "timestamp": now},
+        {"fact": "Interested in AI and technology", "timestamp": now},
+    ]
+    rt.user_model.topics_of_interest = {
+        "python": 2, "ai": 3, "machine learning": 2,
+        "programming": 1, "science": 1,
+    }
+    rt.user_model.communication_style = "curious"
+    logger.info("Seeded API user data for Oscar")
+
+
+def build_local_runtime(config):
+    from local_client import LocalModelClient
+    from local_runtime import LocalCognitiveRuntime
+    from cognitive_state import CognitiveState
+    from concept_graph import ConceptGraph
+    from attention_engine import AttentionEngine
+    from memory_system import MemorySystem
+    from planning_engine import PlanningEngine
+    from world_model import WorldModel
+    from self_model import SelfModel
+    from user_model import UserModel
+
+    local_llm = LocalModelClient(
+        base_url=config["local_base_url"],
+        model=config["local_model"],
+        max_tokens=config["api_max_tokens"] // 2,
+        temperature=config["api_temperature"],
+    )
+    rt = LocalCognitiveRuntime(
+        local_client=local_llm,
+        cognitive_state=CognitiveState(),
+        concept_graph=ConceptGraph(),
+        attention_engine=AttentionEngine(decay_factor=config["attention_decay"]),
+        memory_system=MemorySystem(db_path="local_data/local_memory.db", vector_path="local_data/local_vectors"),
+        planning_engine=PlanningEngine(
+            max_branches=2, max_depth=2,
+        ),
+        world_model=WorldModel(),
+        self_model=SelfModel(),
+        user_model=UserModel(),
+    )
+    if not os.path.exists(os.path.join("local_data", "user_model.json")):
+        rt.seed_initial_state()
+        logger.info("Seeded local initial state")
+        try:
+            rt.save_state("local_data")
+        except Exception as e:
+            logger.warning(f"Failed to save local seed: {e}")
+    if os.path.exists("local_data"):
+        try:
+            rt.load_state("local_data")
+        except Exception as e:
+            logger.warning(f"Could not load local state: {e}")
     return rt
 
 
@@ -105,7 +155,12 @@ class APIHandler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory="static", **kwargs)
 
+    @property
+    def active(self):
+        return local_runtime if current_mode == "local" else api_runtime
+
     def do_POST(self):
+        global current_mode
         parsed = urlparse(self.path)
         if parsed.path == "/api/chat":
             length = int(self.headers.get("Content-Length", 0))
@@ -115,16 +170,26 @@ class APIHandler(SimpleHTTPRequestHandler):
                 self._json({"error": "Empty message"}, 400)
                 return
             try:
-                response = runtime.process(message)
+                response = self.active.process(message)
                 self._json({
                     "response": response,
-                    "usage": runtime.last_usage,
+                    "usage": self.active.last_usage,
+                    "mode": current_mode,
                 })
             except Exception as e:
                 logger.error(f"Chat error: {e}")
                 self._json({"error": str(e)}, 500)
+        elif parsed.path == "/api/mode":
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length))
+            new_mode = body.get("mode", "api")
+            if new_mode in ("api", "local"):
+                current_mode = new_mode
+                self._json({"mode": current_mode, "model": self._model_name()})
+            else:
+                self._json({"error": "Invalid mode"}, 400)
         elif parsed.path == "/api/reset":
-            runtime.state.reset()
+            self.active.state.reset()
             self._json({"status": "ok"})
         else:
             super().do_POST()
@@ -132,34 +197,40 @@ class APIHandler(SimpleHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
         if parsed.path == "/api/state":
-            self._json(runtime.state.to_dict())
+            self._json(self.active.state.to_dict())
         elif parsed.path == "/api/mem":
-            self._json({"summary": runtime.memory.get_memory_summary()})
+            self._json({"summary": self.active.memory.get_memory_summary()})
         elif parsed.path == "/api/graph":
-            active = runtime.graph.get_active_nodes(threshold=0.2)
+            active_nodes = self.active.graph.get_active_nodes(threshold=0.2)
             nodes = [{"name": n, "score": d.get("activation_score", 0)}
-                     for n, d in active[:10]]
+                     for n, d in active_nodes[:10]]
             self._json({"nodes": nodes})
         elif parsed.path == "/api/progress":
-            self._json({"step": runtime.current_step or "idle"})
+            self._json({"step": self.active.current_step or "idle"})
         elif parsed.path == "/api/user":
-            self._json(runtime.user_model.to_dict() if runtime.user_model else {})
+            self._json(self.active.user_model.to_dict() if self.active.user_model else {})
         elif parsed.path == "/api/identity":
-            sm = runtime.self_model
+            sm = self.active.self_model
             self._json({
                 "persona": sm.persona_description,
                 "traits": dict(sm.personality_traits),
                 "values": sm.core_values,
                 "identity_version": sm.identity_version,
                 "total_interactions": sm.total_interactions,
-                "reflections_count": len(sm.reflection_journal),
-                "recent_reflections": [r["insight"] for r in sm.reflection_journal[-5:]],
-                "emotional_history": [e["emotion"] for e in sm.emotional_history[-8:]],
+                "reflections_count": len(sm.reflection_journal) if hasattr(sm, 'reflection_journal') else 0,
+                "recent_reflections": [r["insight"] for r in sm.reflection_journal[-5:]] if hasattr(sm, 'reflection_journal') and sm.reflection_journal else [],
             })
+        elif parsed.path == "/api/mode":
+            self._json({"mode": current_mode, "model": self._model_name()})
         elif parsed.path.startswith("/api/"):
             self._json({"error": "Not found"}, 404)
         else:
             super().do_GET()
+
+    def _model_name(self):
+        if current_mode == "local":
+            return local_runtime.llm.model if local_runtime else "local"
+        return api_runtime.api.model if api_runtime else "api"
 
     def _json(self, data, code=200):
         body = json.dumps(data, default=str).encode("utf-8")
@@ -182,28 +253,41 @@ class APIHandler(SimpleHTTPRequestHandler):
 
 
 def main():
-    global runtime
+    global api_runtime, local_runtime, current_mode
     config = get_config()
 
-    if not config["api_key"]:
-        print("ERROR: API_KEY not set in .env file!")
-        sys.exit(1)
+    logger.info("Initializing API runtime...")
+    api_runtime = build_api_runtime(config)
 
-    logger.info("Initializing DaoTi...")
-    runtime = build_runtime(config)
+    logger.info("Initializing local runtime...")
+    try:
+        local_runtime = build_local_runtime(config)
+        logger.info("Local runtime ready (Gemma 2B via Ollama)")
+    except Exception as e:
+        logger.error(f"Local runtime failed to initialize: {e}")
+        local_runtime = None
 
+    current_mode = "api"
     host = config["host"]
     port = config["port"]
     server = ThreadingHTTPServer((host, port), APIHandler)
+
+    local_status = "available" if local_runtime else "unavailable"
     print(f"\n  Basti Web UI running at:  http://{host}:{port}")
+    print(f"  API mode: deepseek-v4-flash (online)")
+    print(f"  Local mode: {config['local_model']} ({local_status})")
     print(f"  Press Ctrl+C to stop\n")
 
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nShutting down...")
-        runtime.save_state("data")
-        runtime.memory.close()
+        if api_runtime:
+            api_runtime.save_state("data")
+            api_runtime.memory.close()
+        if local_runtime:
+            local_runtime.save_state("local_data")
+            local_runtime.memory.close()
         server.server_close()
 
 

@@ -428,6 +428,47 @@
 
   .overlay.show { display: block; }
 
+  /* Mode switcher */
+  .mode-switcher {
+    display: flex;
+    border-radius: 8px;
+    overflow: hidden;
+    border: 1px solid var(--border);
+  }
+
+  .mode-btn {
+    padding: 5px 12px;
+    font-size: 11px;
+    font-weight: 500;
+    font-family: var(--mono);
+    border: none;
+    background: transparent;
+    color: var(--text-muted);
+    cursor: pointer;
+    transition: all 150ms ease;
+    white-space: nowrap;
+  }
+
+  .mode-btn.active {
+    background: var(--accent-subtle);
+    color: var(--accent);
+  }
+
+  .mode-btn:hover:not(.active) {
+    color: var(--text);
+    background: var(--surface-hover);
+  }
+
+  .mode-indicator {
+    width: 7px; height: 7px;
+    border-radius: 50%;
+    margin-right: 6px;
+    flex-shrink: 0;
+  }
+
+  .mode-indicator.api { background: #6cb2ff; box-shadow: 0 0 6px rgba(108, 178, 255, 0.5); }
+  .mode-indicator.local { background: #6cff8c; box-shadow: 0 0 6px rgba(108, 255, 140, 0.5); }
+
   @media (max-width: 500px) {
     header { padding: 10px 14px; }
     .chat { padding: 14px; }
@@ -449,6 +490,10 @@
   <div class="logo">
     <div class="logo-dot" id="statusDot"></div>
     <span>Basti</span>
+  </div>
+  <div class="mode-switcher" id="modeSwitcher">
+    <button class="mode-btn active" id="modeApi" onclick="switchMode('api')">API</button>
+    <button class="mode-btn" id="modeLocal" onclick="switchMode('local')">Local</button>
   </div>
   <div class="header-actions">
     <button class="btn-icon" onclick="toggleSidebar()" title="View cognitive state" aria-label="View cognitive state">
@@ -507,6 +552,7 @@
 
   let isProcessing = false;
   let progressPoll = null;
+  let currentMode = 'api';
 
   const STEP_LABELS = {
     "idle": "Idle",
@@ -519,12 +565,19 @@
     "building identity context": "Building identity context",
     "loading user profile": "Loading user profile",
     "calling LLM": "Generating with deepseek-v4-flash",
+    "running local LLM": "Generating with Gemma 2B",
   };
 
-  const ALL_STEPS = [
+  const API_STEPS = [
     "parsing input", "updating state", "spreading activation",
     "retrieving memories", "planning", "checking capabilities",
     "building identity context", "loading user profile", "calling LLM"
+  ];
+
+  const LOCAL_STEPS = [
+    "parsing input", "updating state", "spreading activation",
+    "retrieving memories", "planning", "checking capabilities",
+    "building identity context", "loading user profile", "running local LLM"
   ];
 
   messageInput.addEventListener('keydown', (e) => {
@@ -538,6 +591,20 @@
     messageInput.style.height = 'auto';
     messageInput.style.height = Math.min(messageInput.scrollHeight, 160) + 'px';
   });
+
+  function switchMode(mode) {
+    if (isProcessing) return;
+    fetch('/api/mode', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode })
+    }).then(r => r.json()).then(data => {
+      currentMode = data.mode;
+      document.getElementById('modeApi').classList.toggle('active', mode === 'api');
+      document.getElementById('modeLocal').classList.toggle('active', mode === 'local');
+      statusDot.style.background = mode === 'local' ? '#6cff8c' : '';
+    });
+  }
 
   function toggleSidebar() {
     const open = sidebar.classList.toggle('open');
@@ -708,7 +775,12 @@
     body.classList.remove('open');
 
     const summary = bubble.querySelector('.thinking-summary');
-    summary.textContent = `${esc(elapsedSeconds)}s \u00b7 ${esc(promptTokens)} tokens in`;
+    const modeLabel = currentMode === 'local' ? 'local' : 'API';
+    if (promptTokens > 0) {
+      summary.textContent = `${esc(elapsedSeconds)}s \u00b7 ${esc(promptTokens)} tokens in (${modeLabel})`;
+    } else {
+      summary.textContent = `${esc(elapsedSeconds)}s (${modeLabel})`;
+    }
 
     updateThinkingSteps(body, 'idle', false);
     chatContainer.scrollTop = chatContainer.scrollHeight;
@@ -720,8 +792,9 @@
   };
 
   function updateThinkingSteps(body, activeStep, animate) {
+    const steps = currentMode === 'local' ? LOCAL_STEPS : API_STEPS;
     let html = '';
-    for (const step of ALL_STEPS) {
+    for (const step of steps) {
       const label = STEP_LABELS[step] || step;
       const active = (step === activeStep && animate) ? ' active' : '';
       html += `<div class="thinking-step"><span class="step-dot${active}"></span><span>${esc(label)}</span></div>`;
