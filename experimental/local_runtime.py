@@ -5,36 +5,16 @@ from datetime import datetime, timezone
 
 logger = logging.getLogger("daoti.local_runtime")
 
-LOCAL_OUTPUT_SCHEMA = {
-    "intent": "string",
-    "state_update": {},
-    "memory_write": "string or null",
-    "reasoning": "string",
-    "response": "string",
-    "uncertainty": 0.5,
-    "sentiment": 0.0,
-    "user_facts": ["string"],
-}
-
-LOCAL_SCHEMA_DESC = '{"intent":"str","response":"str","reasoning":"str","uncertainty":0.0-1.0,"sentiment":-1.0to1.0,"user_facts":["str"]}'
-
-LOCAL_SYSTEM_PROMPT = """You are Basti (local), a cognitive AI running on-device via Gemma 2B.
+LOCAL_SYSTEM_PROMPT = """You are Basti, a friendly AI running locally on Gemma 2B (DaoTi framework). You help Oscar, an 18-year-old HKUST student.
 
 {identity_context}
 
-User: {user_context}
-
+User profile: {user_context}
 State: {state_summary}
+Key concepts: {active_concepts}
+Recent memories: {memory_summary}
 
-Concepts: {active_concepts}
-
-Memories: {memory_summary}
-
-Reply in JSON: {output_schema}
-
-Instructions: reason first, then respond. Be honest about limits. Keep reasoning short (1-2 sentences).
-
-Reply ONLY with valid JSON. No other text."""
+Keep responses under 3 sentences. Be direct and honest. Do not use JSON format, just reply naturally."""
 
 
 class LocalCognitiveRuntime:
@@ -55,6 +35,8 @@ class LocalCognitiveRuntime:
         self.last_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         self._cached_identity = None
         self._cached_identity_version = 0
+        self._cached_user_context = None
+        self._cached_user_interactions = 0
 
     def process(self, user_input: str) -> str:
         self.current_step = "parsing input"
@@ -68,104 +50,103 @@ class LocalCognitiveRuntime:
         })
 
         self.current_step = "spreading activation"
-        self.graph.spread_activation(self.state.attention_focus[:5], steps=2)
-        active = self.attention.select_top_k(self.graph, self.state, user_input, k=4)
+        self.graph.spread_activation(self.state.attention_focus[:3], steps=1)
+        active = self.attention.select_top_k(self.graph, self.state, user_input, k=3)
         active_names = [n[0] for n in active]
 
         self.current_step = "retrieving memories"
         memory_context = self.memory.get_memory_summary()
+        if len(memory_context) > 150:
+            memory_context = memory_context[:150] + "..."
 
         self.current_step = "planning"
-        plan_result = self.planner.plan(user_input, self.state, self.graph, self.memory, None)
+        try:
+            plan_result = self.planner.plan(user_input, self.state, self.graph, self.memory, None)
+        except Exception:
+            plan_result = {"response_mode": "direct"}
 
         can_handle, confidence = self.self_model.can_handle(user_input)
-
         goals = [g.get("description", "") for g in self.state.active_goals]
-        state_summary = (
-            f"goals={goals}, confidence={confidence:.2f}"
-            if goals else f"confidence={confidence:.2f}"
-        )
+        state_summary = f"goals={goals}" if goals else "none"
 
         self.current_step = "building identity context"
-        if self._cached_identity is None or self.self_model.identity_version != self._cached_identity_version:
-            self._cached_identity = self._get_compact_identity()
+        if (self._cached_identity is None
+                or self.self_model.identity_version != self._cached_identity_version):
+            self._cached_identity = _compact_identity(self.self_model)
             self._cached_identity_version = self.self_model.identity_version
         identity_context = self._cached_identity
 
         self.current_step = "loading user profile"
-        user_context = self.user_model.get_user_context() if self.user_model else "No user profile."
+        if (self._cached_user_context is None
+                or (self.user_model
+                    and self.user_model.interaction_count != self._cached_user_interactions)):
+            self._cached_user_context = _compact_user(self.user_model)
+            self._cached_user_interactions = self.user_model.interaction_count if self.user_model else 0
+        user_context = self._cached_user_context
 
         system_prompt = LOCAL_SYSTEM_PROMPT.format(
             identity_context=identity_context,
-            user_context=user_context[:300],
+            user_context=user_context,
             state_summary=state_summary,
-            active_concepts=", ".join(active_names[:3]) if active_names else "none",
-            memory_summary=memory_context[:300] if memory_context else "none",
-            output_schema=LOCAL_SCHEMA_DESC,
+            active_concepts=", ".join(active_names) if active_names else "none",
+            memory_summary=memory_context if memory_context else "none",
         )
 
         if plan_result.get("response_mode") == "direct":
-            system_prompt += "\nShort answer. Be concise."
+            system_prompt += " Answer directly."
         if can_handle:
-            system_prompt += f"\nConfidence: {confidence:.2f}"
+            system_prompt += f" Confidence: {confidence:.2f}."
         else:
-            system_prompt += f"\nLow confidence ({confidence:.2f}). Be careful."
+            system_prompt += f" Low confidence ({confidence:.2f}). Be careful."
 
         messages = [{"role": "user", "content": user_input}]
 
         self.current_step = "running local LLM"
         try:
-            result = self.llm.chat_structured(messages, LOCAL_OUTPUT_SCHEMA, system_prompt)
+            response_text, usage = self.llm.chat(messages, system_prompt)
+            self.last_usage = usage
         except Exception as e:
             self.current_step = "idle"
             logger.error(f"Local LLM error: {e}")
             return f"[Local error: {e}]"
 
-        self.last_usage = result.pop("_usage", {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0})
+        if not response_text or not response_text.strip():
+            response_text = "I'm having trouble processing that. Can you rephrase?"
 
-        if result.get("_raw"):
-            response_text = result.get("response", str(result))
-        else:
-            response_text = result.get("response", str(result))
-            if not response_text:
-                response_text = result.get("reasoning", "I'm thinking...") or "Let me think about that."
-
-        self._update_from_result(result, user_input, response_text)
+        self._update_state_lightweight(user_input, response_text)
 
         self.conversation_history.append({"role": "user", "content": user_input})
         self.conversation_history.append({"role": "assistant", "content": response_text})
-        if len(self.conversation_history) > 10:
-            self.conversation_history = self.conversation_history[-10:]
+        if len(self.conversation_history) > 8:
+            self.conversation_history = self.conversation_history[-8:]
 
         self.current_step = "idle"
-        return response_text
+        return response_text.strip()
 
-    def _update_from_result(self, result: dict, user_input: str, response_text: str):
-        memory_text = result.get("memory_write")
-        if memory_text:
+    def _update_state_lightweight(self, user_input: str, response_text: str):
+        try:
             self.memory.store_episodic(
-                f"User: {user_input[:100]} | Response: {memory_text[:100]}",
+                f"User: {user_input[:100]} | Response: {response_text[:100]}",
                 {"type": "interaction"}, importance=0.5
             )
+        except Exception:
+            pass
 
-        uncertainty = result.get("uncertainty", 0.5)
         domain = self.self_model._classify_domain(user_input)
-        new_conf = self.self_model.confidence_levels.get(domain, 0.5)
-        new_conf = 0.85 * new_conf + 0.15 * (1.0 - uncertainty)
-        self.self_model.update_confidence(domain, new_conf)
-        self.state.update_uncertainty("current", uncertainty)
+        current = self.self_model.confidence_levels.get(domain, 0.5)
+        self.self_model.update_confidence(domain, current * 0.95 + 0.05 * 0.6)
 
-        state_update = result.get("state_update", {})
-        if isinstance(state_update, dict):
-            if "goal" in state_update:
-                self.state.add_goal({"description": state_update["goal"]})
-            if "emotion" in state_update:
-                self.state.set_emotion(state_update["emotion"], 0.3)
-
+        fake_result = {"response": response_text, "uncertainty": 0.4, "sentiment": 0.2,
+                       "user_facts": [], "state_update": {}}
         if self.user_model:
-            self.user_model.update_from_interaction(user_input, response_text, result)
-
-        self.self_model.update_from_interaction(user_input, response_text, result, self.user_model)
+            try:
+                self.user_model.update_from_interaction(user_input, response_text, fake_result)
+            except Exception:
+                pass
+        try:
+            self.self_model.update_from_interaction(user_input, response_text, fake_result, self.user_model)
+        except Exception:
+            pass
 
     def _extract_keywords(self, text: str) -> list:
         words = re.findall(r'[a-zA-Z]{3,}', text.lower())
@@ -174,12 +155,6 @@ class LocalCognitiveRuntime:
                      "have", "that", "this", "with", "from", "they", "will",
                      "what", "when", "where", "which", "how", "who", "why"}
         return [w for w in words if w not in stopwords][:6]
-
-    def _get_compact_identity(self) -> str:
-        persona = self.self_model.persona_description
-        traits = sorted(self.self_model.personality_traits.items(), key=lambda x: x[1], reverse=True)
-        top_traits = ", ".join(f"{k}={v:.0%}" for k, v in traits[:3])
-        return f"{persona} Top traits: {top_traits}. Total interactions: {self.self_model.total_interactions}."
 
     def save_state(self, directory: str = "local_data"):
         import os
@@ -192,7 +167,6 @@ class LocalCognitiveRuntime:
         state_path = os.path.join(directory, "cognitive_state.json")
         with open(state_path, "w", encoding="utf-8") as f:
             json.dump(self.state.to_dict(), f, indent=2)
-        logger.info(f"Local state saved to {directory}")
 
     def load_state(self, directory: str = "local_data"):
         import os
@@ -217,25 +191,17 @@ class LocalCognitiveRuntime:
         if os.path.exists(sp):
             with open(sp, "r", encoding="utf-8") as f:
                 self.state = CognitiveState.from_dict(json.load(f))
-        logger.info(f"Local state loaded from {directory}")
 
     def seed_initial_state(self):
         self.self_model.persona_description = (
             "Basti (local) is a cognitive AI running on-device via Gemma 2B. "
-            "She is built on the DaoTi framework and runs entirely on your computer. "
-            "She is honest, growing, and curious. She serves Oscar, her user."
+            "She is built on the DaoTi framework and runs entirely locally. "
+            "She is honest, growing, and curious. She serves Oscar."
         )
         self.self_model.personality_traits.update({
             "openness": 0.75, "conscientiousness": 0.80,
             "curiosity": 0.85, "humility": 0.75, "analytical": 0.70,
         })
-        self.self_model.core_values = [
-            "honesty about capabilities",
-            "continuous self-improvement",
-            "privacy-first on-device operation",
-            "understanding the user as an individual",
-            "clarity over impressiveness",
-        ]
         if self.user_model:
             self.user_model.name = "Oscar"
             self.user_model.expertise_levels = {
@@ -253,3 +219,22 @@ class LocalCognitiveRuntime:
                 "programming": 1, "science": 1,
             }
             self.user_model.communication_style = "curious"
+
+
+def _compact_identity(sm) -> str:
+    persona = sm.persona_description
+    traits = sorted(sm.personality_traits.items(), key=lambda x: x[1], reverse=True)
+    top = ", ".join(f"{k}={v:.0%}" for k, v in traits[:3])
+    return f"{persona[:120]} Traits: {top}. Interactions: {sm.total_interactions}."
+
+
+def _compact_user(um) -> str:
+    if not um:
+        return "No user profile."
+    parts = []
+    if um.name:
+        parts.append(f"Name: {um.name}")
+    facts = [f["fact"] for f in um.personal_facts[-3:]] if um.personal_facts else []
+    if facts:
+        parts.append(f"Facts: {'; '.join(facts)}")
+    return ". ".join(parts) if parts else "No user profile."

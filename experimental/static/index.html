@@ -715,11 +715,20 @@
       } catch (e) {}
     }, 300);
 
+    const abortController = new AbortController();
+    const timeoutId = setTimeout(() => abortController.abort(), 120000);
+
+    let elapsedInterval = setInterval(() => {
+      const elapsed = ((performance.now() - startTime) / 1000).toFixed(0);
+      if (summaryEl) summaryEl.textContent = `Waiting (${elapsed}s)...`;
+    }, 1000);
+
     try {
       const res = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message })
+        body: JSON.stringify({ message }),
+        signal: abortController.signal,
       });
       const data = await res.json();
       if (data.error) throw new Error(data.error);
@@ -728,8 +737,15 @@
       finishAssistantMessage(msgEl, data.response, elapsed, promptTokens);
     } catch (e) {
       const elapsed = ((performance.now() - startTime) / 1000).toFixed(1);
-      finishAssistantMessage(msgEl, `Error: ${e.message}`, elapsed, 0);
+      if (e.name === 'AbortError') {
+        finishAssistantMessage(msgEl, `Request timed out after ${elapsed}s. Please retry.`, elapsed, 0);
+      } else {
+        finishAssistantMessage(msgEl, `Error: ${e.message}`, elapsed, 0);
+      }
     }
+
+    clearTimeout(timeoutId);
+    clearInterval(elapsedInterval);
 
     clearInterval(progressPoll);
     progressPoll = null;
